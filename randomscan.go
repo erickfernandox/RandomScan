@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"compress/flate"
+	"compress/gzip"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -45,7 +47,7 @@ func init() {
 	flag.StringVar(&proxy, "x", "", "Proxy URL (HTTP proxy supported for raw CRLF read)")
 	flag.BoolVar(&onlyPOC, "only-poc", false, "Show only PoC output (suppress Not Vulnerable)")
 	flag.BoolVar(&onlyPOC, "s", false, "Show only PoC output (suppress Not Vulnerable)")
-	flag.BoolVar(&htmlOnly, "html", false, "Only print XSS/Link matches if Content-Type is text/html")
+	flag.BoolVar(&htmlOnly, "html", false, "Only print XSS/Link results if Content-Type is text/html")
 	flag.Var(&headers, "H", "Add header (repeatable)")
 	flag.Var(&headers, "headers", "Add header (repeatable)")
 	flag.IntVar(&concurrency, "t", 50, "Number of threads (default 50, minimum 15)")
@@ -146,16 +148,58 @@ func getRandomParams(params []string, count int) []string {
 	}
 	r := make([]string, len(params))
 	copy(r, params)
-	rand.Shuffle(len(r), func(i, j int) { r[i], r[j] = r[j], r[i] })
+	rand.Shuffle(len(params), func(i, j int) {
+		r[i], r[j] = r[j], r[i]
+	})
 	return r[:count]
+}
+
+// -------------------- Headers padrão --------------------
+
+func defaultHeaderMap() map[string]string {
+	return map[string]string{
+		"User-Agent":      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+		"Accept-Encoding": "gzip, deflate, br", // ATENÇÃO: stdlib não decodifica br
+		"Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7,ar;q=0.6",
+		"Connection":      "close",
+	}
+}
+
+func userHeaderMap(h customheaders) map[string]string {
+	m := make(map[string]string)
+	for _, raw := range h {
+		parts := strings.SplitN(raw, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		if k != "" {
+			m[http.CanonicalHeaderKey(k)] = v
+		}
+	}
+	return m
+}
+
+func mergeHeaders(base map[string]string, override map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(override))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
 }
 
 // -------------------- HTTP client e headers --------------------
 
 func buildClient() *http.Client {
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		DialContext:     (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
+		TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
+		DialContext:        (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
+		DisableCompression: true, // vamos decodificar manualmente (gzip/deflate)
 	}
 	if proxy != "" {
 		if p, err := url.Parse(proxy); err == nil {
@@ -165,17 +209,15 @@ func buildClient() *http.Client {
 	return &http.Client{
 		Transport: tr,
 		Timeout:   8 * time.Second,
-		// default segue redirects (bom para Redirect/SSRF)
 	}
 }
 
 func applyHeaders(req *http.Request) {
-	req.Header.Set("Connection", "close")
-	for _, h := range headers {
-		parts := strings.SplitN(h, ":", 2)
-		if len(parts) == 2 {
-			req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
-		}
+	base := defaultHeaderMap()
+	user := userHeaderMap(headers)
+	final := mergeHeaders(base, user) // -H sobrescreve padrão
+	for k, v := range final {
+		req.Header.Set(k, v)
 	}
 }
 
@@ -196,9 +238,9 @@ func buildQueryRaw(params []string, rawValue string) string {
 		if i > 0 {
 			b.WriteByte('&')
 		}
-		b.WriteString(url.QueryEscape(p)) // nome do param seguro
+		b.WriteString(url.QueryEscape(p))
 		b.WriteByte('=')
-		b.WriteString(rawValue) // valor já "pré-encodado" conforme payload (ou literal)
+		b.WriteString(rawValue)
 	}
 	return b.String()
 }
@@ -234,7 +276,6 @@ func runAllTests(base string) []string {
 	client := buildClient()
 
 	tests := []TestCase{
-		// XSS Tag
 		{
 			Name:     "XSS",
 			Payloads: []string{`%27%22teste`},
@@ -249,7 +290,6 @@ func runAllTests(base string) []string {
 				return false, ""
 			},
 		},
-		// XSS Script
 		{
 			Name:     "XSS Script",
 			Payloads: []string{`%3C%2Fscript%3E%3Cteste%3E`},
@@ -264,13 +304,11 @@ func runAllTests(base string) []string {
 				return false, ""
 			},
 		},
-		// CRLF Injection (checa header CRU iniciando com "set-cookie: efx")
 		{
 			Name:     "CRLF Injection",
 			Payloads: []string{`%0d%0aset-cookie:efx`, `%0d%0a%0d%0aset-cookie:efx`},
 			NeedHTML: false,
 			Detector: func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string) {
-				// Verificação crua do cabeçalho
 				rawHead, rawErr := fetchRawResponseHead(method, urlStr, sentBody, headers, proxy)
 				if rawErr == nil {
 					lines := strings.Split(rawHead, "\r\n")
@@ -284,7 +322,6 @@ func runAllTests(base string) []string {
 				return false, ""
 			},
 		},
-		// Redirect / SSRF (segue redirect/fetch e procura Example Domain no body)
 		{
 			Name:     "Redirect/SSRF",
 			Payloads: []string{`https://example.com`},
@@ -296,7 +333,6 @@ func runAllTests(base string) []string {
 				return false, ""
 			},
 		},
-		// Link Manipulation
 		{
 			Name:     "Link Manipulation",
 			Payloads: []string{`https://efxtech.com`},
@@ -314,9 +350,8 @@ func runAllTests(base string) []string {
 				return false, ""
 			},
 		},
-		// SSTI (variações comuns de sintaxe; match: 49efxtech)
 		{
-			Name:     "SSTI",
+			Name: "SSTI",
 			Payloads: []string{
 				`{{7*7}}efxtech`,
 				`${{7*7}}efxtech`,
@@ -343,7 +378,7 @@ func runAllTests(base string) []string {
 				if err == nil {
 					applyHeaders(req)
 					if resp, err := client.Do(req); err == nil {
-						body, _ := readAllLimit(resp.Body, 2<<20) // 2MB
+						body, _ := readBodyDecodedLimit(resp, 2<<20) // 2MB
 						resp.Body.Close()
 						if (!tc.NeedHTML || isHTML(resp)) && (!htmlOnly || !tc.NeedHTML || isHTML(resp)) {
 							if vul, detail := tc.Detector("GET", getURL, resp, body, ""); vul {
@@ -364,7 +399,7 @@ func runAllTests(base string) []string {
 				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 				applyHeaders(req)
 				if resp, err := client.Do(req); err == nil {
-					body, _ := readAllLimit(resp.Body, 2<<20)
+					body, _ := readBodyDecodedLimit(resp, 2<<20)
 					resp.Body.Close()
 					if (!tc.NeedHTML || isHTML(resp)) && (!htmlOnly || !tc.NeedHTML || isHTML(resp)) {
 						if vul, detail := tc.Detector("POST", postURL, resp, body, bodyStr); vul {
@@ -403,6 +438,11 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 	var conn net.Conn
 	dialTimeout := 6 * time.Second
 
+	// headers padrão + sobrescrita do usuário
+	base := defaultHeaderMap()
+	user := userHeaderMap(addHeaders)
+	final := mergeHeaders(base, user)
+
 	readHead := func(c net.Conn, reqTarget string, tlsWrap bool) (string, error) {
 		if tlsWrap {
 			serverName := u.Hostname()
@@ -424,15 +464,21 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 		var b strings.Builder
 		b.WriteString(reqLine)
 		b.WriteString("Host: " + u.Host + "\r\n")
-		b.WriteString("Connection: close\r\n")
-		for _, h := range addHeaders {
-			parts := strings.SplitN(h, ":", 2)
-			if len(parts) == 2 {
-				b.WriteString(strings.TrimSpace(parts[0]) + ": " + strings.TrimSpace(parts[1]) + "\r\n")
+
+		for k, v := range final {
+			if strings.EqualFold(k, "Host") {
+				continue
 			}
+			if method == "POST" && strings.EqualFold(k, "Content-Type") {
+				continue
+			}
+			b.WriteString(k + ": " + v + "\r\n")
 		}
+
 		if method == "POST" && body != "" {
-			b.WriteString("Content-Type: application/x-www-form-urlencoded\r\n")
+			if _, hasCT := final["Content-Type"]; !hasCT {
+				b.WriteString("Content-Type: application/x-www-form-urlencoded\r\n")
+			}
 			b.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
 		}
 		b.WriteString("\r\n")
@@ -492,7 +538,6 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 	defer conn.Close()
 
 	if u.Scheme == "http" {
-		// Requisição ao proxy com alvo absoluto
 		return readHead(conn, u.String(), false)
 	}
 
@@ -521,7 +566,6 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 		return "", fmt.Errorf("proxy CONNECT failed")
 	}
 
-	// Agora túnel TLS estabelecido; lê headers do request real
 	return readHead(conn, "", true)
 }
 
@@ -533,6 +577,28 @@ func isHTML(resp *http.Response) bool {
 }
 
 func contains(body []byte, s string) bool { return strings.Contains(string(body), s) }
+
+// decodifica gzip/deflate quando necessário (brotli não suportado na stdlib)
+func readBodyDecodedLimit(resp *http.Response, max int64) ([]byte, error) {
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	var r io.Reader = io.LimitReader(resp.Body, max)
+
+	switch enc {
+	case "gzip":
+		gr, err := gzip.NewReader(io.LimitReader(resp.Body, max))
+		if err != nil {
+			return io.ReadAll(r) // fallback cru
+		}
+		defer gr.Close()
+		return io.ReadAll(gr)
+	case "deflate":
+		fr := flate.NewReader(io.LimitReader(resp.Body, max))
+		defer fr.Close()
+		return io.ReadAll(fr)
+	default:
+		return io.ReadAll(r)
+	}
+}
 
 func readAllLimit(r io.ReadCloser, max int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r, max))
