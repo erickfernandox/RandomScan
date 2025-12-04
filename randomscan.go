@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,10 @@ var (
 	paramList   []string
 	concurrency int
 	htmlOnly    bool
+
+	// NOVO: filtro de opções de scan (-o)
+	scanOpt    string
+	scanFilter map[int]bool
 )
 
 func init() {
@@ -51,6 +56,15 @@ func init() {
 	flag.Var(&headers, "H", "Add header (repeatable)")
 	flag.Var(&headers, "headers", "Add header (repeatable)")
 	flag.IntVar(&concurrency, "t", 50, "Number of threads (default 50, minimum 15)")
+
+	// NOVO: opção -o
+	flag.StringVar(&scanOpt, "o", "", "Scan options (e.g. 1,2 for XSS and CRLF)\n"+
+		"   1 = XSS (inclui XSS Script)\n"+
+		"   2 = CRLF Injection\n"+
+		"   3 = Redirect/SSRF\n"+
+		"   4 = Link Manipulation\n"+
+		"   5 = SSTI")
+
 	flag.Usage = usage
 }
 
@@ -64,6 +78,12 @@ Usage:
   -s        Show only PoC (hide "Not Vulnerable")
   -html     Only print XSS/Link results if Content-Type is text/html
   -t        Number of threads (default 50, minimum 15)
+  -o        Scan options (e.g. -o 1,2)
+            1 = XSS (inclui XSS Script)
+            2 = CRLF Injection
+            3 = Redirect/SSRF
+            4 = Link Manipulation
+            5 = SSTI
 `)
 }
 
@@ -74,6 +94,9 @@ func main() {
 	if concurrency < 15 {
 		concurrency = 15
 	}
+
+	// NOVO: parse das opções de scan
+	scanFilter = parseScanOptions(scanOpt)
 
 	if paramFile != "" {
 		params, err := readParamFile(paramFile)
@@ -261,6 +284,7 @@ func buildFormBodyRaw(params []string, rawValue string) string {
 // -------------------- Test cases --------------------
 
 type TestCase struct {
+	ID       int
 	Name     string
 	Payloads []string
 	NeedHTML bool
@@ -275,8 +299,15 @@ func runAllTests(base string) []string {
 	selectedParams := getRandomParams(paramList, paramCount)
 	client := buildClient()
 
+	// IDs usados com -o:
+	// 1 = XSS (XSS + XSS Script)
+	// 2 = CRLF Injection
+	// 3 = Redirect/SSRF
+	// 4 = Link Manipulation
+	// 5 = SSTI
 	tests := []TestCase{
 		{
+			ID:       1,
 			Name:     "XSS",
 			Payloads: []string{`%27%22teste`},
 			NeedHTML: true,
@@ -291,6 +322,7 @@ func runAllTests(base string) []string {
 			},
 		},
 		{
+			ID:       1,
 			Name:     "XSS Script",
 			Payloads: []string{`%3C%2Fscript%3E%3Cteste%3E`},
 			NeedHTML: true,
@@ -305,6 +337,7 @@ func runAllTests(base string) []string {
 			},
 		},
 		{
+			ID:       2,
 			Name:     "CRLF Injection",
 			Payloads: []string{`%0d%0aset-cookie:efx`, `%0d%0a%0d%0aset-cookie:efx`},
 			NeedHTML: false,
@@ -323,6 +356,7 @@ func runAllTests(base string) []string {
 			},
 		},
 		{
+			ID:       3,
 			Name:     "Redirect/SSRF",
 			Payloads: []string{`https://example.com`},
 			NeedHTML: false,
@@ -334,6 +368,7 @@ func runAllTests(base string) []string {
 			},
 		},
 		{
+			ID:       4,
 			Name:     "Link Manipulation",
 			Payloads: []string{`https://efxtech.com`},
 			NeedHTML: true,
@@ -351,6 +386,7 @@ func runAllTests(base string) []string {
 			},
 		},
 		{
+			ID: 5,
 			Name: "SSTI",
 			Payloads: []string{
 				`{{7*7}}efxtech`,
@@ -370,6 +406,11 @@ func runAllTests(base string) []string {
 	var results []string
 
 	for _, tc := range tests {
+		// se scanFilter != nil, só roda IDs selecionados
+		if scanFilter != nil && !scanFilter[tc.ID] {
+			continue
+		}
+
 		for _, payload := range tc.Payloads {
 			// -------- GET --------
 			getURL, ok := addParamsRaw(base, selectedParams, payload)
@@ -622,4 +663,32 @@ func formatNotVuln(kind, method, urlStr string) string {
 		return ""
 	}
 	return fmt.Sprintf("Not Vulnerable [%s] - %s %s", kind, method, urlStr)
+}
+
+// NOVO: parse das opções passadas em -o (ex: "1,2,5")
+func parseScanOptions(opt string) map[int]bool {
+	opt = strings.TrimSpace(opt)
+	if opt == "" {
+		return nil // nil => roda todos os testes
+	}
+	m := make(map[int]bool)
+	parts := strings.Split(opt, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			continue
+		}
+		if n <= 0 {
+			continue
+		}
+		m[n] = true
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
