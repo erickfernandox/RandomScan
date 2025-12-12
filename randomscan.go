@@ -73,7 +73,7 @@ func init() {
 Usage:
   -lp       List of parameters in txt file
   -params   Number of parameters to inject (random sample, clusterbomb)
-  -proxy    Proxy address (HTTP proxy supported for raw CRLF check)
+  -proxy    Proxy address (HTTP proxy supported in raw CRLF check)
   -H        Headers (repeatable)
   -s        Show only PoC (hide "Not Vulnerable")
   -html     Only print XSS/Link results if Content-Type is text/html
@@ -163,7 +163,6 @@ func readParamFile(path string) ([]string, error) {
 	return params, sc.Err()
 }
 
-// getRandomParams retorna N parâmetros (ou nil se count <=0)
 func getRandomParams(params []string, count int) []string {
 	if count <= 0 || len(params) == 0 {
 		return nil
@@ -222,7 +221,7 @@ func buildClient() *http.Client {
 	tr := &http.Transport{
 		TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
 		DialContext:        (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
-		DisableCompression: true, // vamos decodificar manualmente
+		DisableCompression: true,
 	}
 	if proxy != "" {
 		if p, err := url.Parse(proxy); err == nil {
@@ -272,7 +271,7 @@ func buildFormBodyRaw(params []string, rawValue string) string {
 	return b.String()
 }
 
-// addParamsRaw monta URL GET normal com os params selecionados
+// GET normal com clusterbomb
 func addParamsRaw(baseURL string, params []string, rawValue string) (string, bool) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -282,19 +281,37 @@ func addParamsRaw(baseURL string, params []string, rawValue string) (string, boo
 	return u.String(), true
 }
 
-// addTraversalAndParamsRaw monta URL com traversal EXACTO no path: "/%2e%2e%2f" (sem double-encoding)
+// Traversal genérico: /%2e%2e%2f?<clusterbomb>
+// Usado APENAS em:
+//  - XSS básico (ID=1, Name=="XSS", payload %27%22teste)
+//  - Open redirect (ID=3, payload https://example.com)
 func addTraversalAndParamsRaw(baseURL string, params []string, rawValue string) (string, bool) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
+		// tenta baseURL sem esquema
+		u2, err2 := url.Parse("http://" + baseURL)
+		if err2 != nil {
+			return "", false
+		}
+		u = u2
+	}
+
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	host := u.Host
+	if host == "" {
 		return "", false
 	}
-	// define RawPath exatamente como queremos; String() irá respeitar RawPath quando possível
-	u.Path = "/%2e%2e%2f"   // Path pode ser usado por compatibilidade
-	u.RawPath = "/%2e%2e%2f" // força manter o %2e em vez de %252e
-	u.RawQuery = buildQueryRaw(params, rawValue)
-	// Garantia extra: se houver fragment/opaque etc, limpamos Opaque (para evitar reescape)
-	u.Opaque = ""
-	return u.String(), true
+
+	query := buildQueryRaw(params, rawValue)
+	path := "/%2e%2e%2f"
+
+	if query != "" {
+		return fmt.Sprintf("%s://%s%s?%s", scheme, host, path, query), true
+	}
+	return fmt.Sprintf("%s://%s%s", scheme, host, path), true
 }
 
 // -------------------- Test cases --------------------
@@ -319,9 +336,9 @@ func runAllTests(base string) []string {
 		{
 			ID:       1,
 			Name:     "XSS",
-			Payloads: []string{`%27%22teste`, `%3f%26%27%22teste`}, // adicionado %3f%26%27%22teste
+			Payloads: []string{`%27%22teste`, `%3f%26%27%22teste`},
 			NeedHTML: true,
-			Detector: func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string) {
+			Detector: func(method, urlStr string, resp *http.Response, body []byte, _ string) (bool, string) {
 				if !isHTML(resp) {
 					return false, ""
 				}
@@ -336,7 +353,7 @@ func runAllTests(base string) []string {
 			Name:     "XSS Script",
 			Payloads: []string{`%3C%2Fscript%3E%3Cteste%3E`},
 			NeedHTML: true,
-			Detector: func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string) {
+			Detector: func(method, urlStr string, resp *http.Response, body []byte, _ string) (bool, string) {
 				if !isHTML(resp) {
 					return false, ""
 				}
@@ -351,7 +368,7 @@ func runAllTests(base string) []string {
 			Name:     "CRLF Injection",
 			Payloads: []string{`%0d%0aset-cookie:efx`, `%0d%0a%0d%0aset-cookie:efx`},
 			NeedHTML: false,
-			Detector: func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string) {
+			Detector: func(method, urlStr string, _ *http.Response, _ []byte, sentBody string) (bool, string) {
 				rawHead, rawErr := fetchRawResponseHead(method, urlStr, sentBody, headers, proxy)
 				if rawErr == nil {
 					lines := strings.Split(rawHead, "\r\n")
@@ -366,11 +383,15 @@ func runAllTests(base string) []string {
 			},
 		},
 		{
-			ID:       3,
-			Name:     "Redirect/SSRF + Open Redirect",
-			Payloads: []string{`https://example.com`, `//example.com`, `/%5cexample.com`},
+			ID: 3,
+			Name: "Redirect/SSRF + Open Redirect",
+			Payloads: []string{
+				`https://example.com`,
+				`//example.com`,
+				`/%5cexample.com`,
+			},
 			NeedHTML: false,
-			Detector: func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string) {
+			Detector: func(method, urlStr string, _ *http.Response, body []byte, _ string) (bool, string) {
 				if strings.Contains(string(body), "Example Domain") {
 					return true, "match: Example Domain"
 				}
@@ -382,7 +403,7 @@ func runAllTests(base string) []string {
 			Name:     "Link Manipulation",
 			Payloads: []string{`https://efxtech.com`},
 			NeedHTML: true,
-			Detector: func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string) {
+			Detector: func(method, urlStr string, resp *http.Response, body []byte, _ string) (bool, string) {
 				if !isHTML(resp) {
 					return false, ""
 				}
@@ -392,9 +413,13 @@ func runAllTests(base string) []string {
 		{
 			ID:       5,
 			Name:     "SSTI",
-			Payloads: []string{`{{7*7}}efxtech`, `${{7*7}}efxtech`, `*{7*7}efxtech`},
+			Payloads: []string{
+				`{{7*7}}efxtech`,
+				`${{7*7}}efxtech`,
+				`*{7*7}efxtech`,
+			},
 			NeedHTML: false,
-			Detector: func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string) {
+			Detector: func(method, urlStr string, _ *http.Response, body []byte, _ string) (bool, string) {
 				if strings.Contains(string(body), "49efxtech") {
 					return true, "match: 49efxtech"
 				}
@@ -411,7 +436,7 @@ func runAllTests(base string) []string {
 				`%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd`,
 			},
 			NeedHTML: false,
-			Detector: func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string) {
+			Detector: func(method, urlStr string, _ *http.Response, body []byte, _ string) (bool, string) {
 				if strings.Contains(string(body), "root:x:") {
 					return true, "match: root:x:"
 				}
@@ -423,32 +448,39 @@ func runAllTests(base string) []string {
 	var results []string
 
 	for _, tc := range tests {
-		// se scanFilter não é nil, rodar só IDs selecionados
 		if scanFilter != nil && !scanFilter[tc.ID] {
 			continue
 		}
-
 		for _, payload := range tc.Payloads {
-			// GET normal (params no query)
-			getURL, ok := addParamsRaw(base, selectedParams, payload)
-			if ok {
-				if res := doRequestAndDetect(client, "GET", getURL, nil, tc); res != "" {
+
+			// -------- GET normal (clusterbomb) --------
+			if getURL, ok := addParamsRaw(base, selectedParams, payload); ok {
+				if res := doRequestAndDetect(client, "GET", getURL, tc, ""); res != "" {
 					results = append(results, res)
 				}
 			}
 
-			// GET com directory traversal no endpoint (path = /%2e%2e%2f)
-			travURL, ok2 := addTraversalAndParamsRaw(base, selectedParams, payload)
-			if ok2 {
-				if res := doRequestAndDetect(client, "GET", travURL, nil, tc); res != "" {
-					// marcar detalhe TRAV no formato (feito no detector output se quiser)
-					results = append(results, res)
+			// -------- Traversal SOMENTE para:
+			//  - XSS básico com payload %27%22teste
+			if tc.ID == 1 && tc.Name == "XSS" && payload == `%27%22teste` {
+				if travURL, ok := addTraversalAndParamsRaw(base, selectedParams, payload); ok {
+					if res := doRequestAndDetect(client, "GET", travURL, tc, ""); res != "" {
+						results = append(results, res)
+					}
+				}
+			}
+			//  - Open redirect com payload https://example.com
+			if tc.ID == 3 && payload == `https://example.com` {
+				if travURL, ok := addTraversalAndParamsRaw(base, selectedParams, payload); ok {
+					if res := doRequestAndDetect(client, "GET", travURL, tc, ""); res != "" {
+						results = append(results, res)
+					}
 				}
 			}
 
-			// POST x-www-form-urlencoded
+			// -------- POST x-www-form-urlencoded (clusterbomb) --------
 			bodyStr := buildFormBodyRaw(selectedParams, payload)
-			if res := doRequestAndDetect(client, "POST", base, strings.NewReader(bodyStr), tc, bodyStr); res != "" {
+			if res := doRequestAndDetect(client, "POST", base, tc, bodyStr); res != "" {
 				results = append(results, res)
 			}
 		}
@@ -457,18 +489,15 @@ func runAllTests(base string) []string {
 	return results
 }
 
-// doRequestAndDetect faz a request (GET/POST) e aplica o detector do TestCase.
-// Para GET o reader deve ser nil; para POST passa reader e contentBody (string) como último arg.
-func doRequestAndDetect(client *http.Client, method, fullURL string, bodyReader io.Reader, tc TestCase, extra ...string) string {
+// -------------------- doRequestAndDetect --------------------
+
+// extraBody: para POST, é o body enviado (aparece no output)
+func doRequestAndDetect(client *http.Client, method, fullURL string, tc TestCase, extraBody string) string {
 	var req *http.Request
 	var err error
+
 	if method == "POST" {
-		// extra[0] contém o body string (quando aplicável)
-		bodyStr := ""
-		if len(extra) > 0 {
-			bodyStr = extra[0]
-		}
-		req, err = http.NewRequest("POST", fullURL, strings.NewReader(bodyStr))
+		req, err = http.NewRequest("POST", fullURL, strings.NewReader(extraBody))
 		if err != nil {
 			return ""
 		}
@@ -489,27 +518,43 @@ func doRequestAndDetect(client *http.Client, method, fullURL string, bodyReader 
 	body, _ := readBodyDecodedLimit(resp, 2<<20)
 	resp.Body.Close()
 
-	// Verifica se precisa de HTML e aplica filtro htmlOnly
-	if (tc.NeedHTML && !isHTML(resp)) || (htmlOnly && tc.NeedHTML && !isHTML(resp)) {
+	if tc.NeedHTML && !isHTML(resp) {
+		return ""
+	}
+	if htmlOnly && tc.NeedHTML && !isHTML(resp) {
 		return ""
 	}
 
-	// Chama detector
-	var sentBody string
-	if method == "POST" && len(extra) > 0 {
-		sentBody = extra[0]
+	sentBody := ""
+	if method == "POST" {
+		sentBody = extraBody
 	}
-	if vul, det := tc.Detector(method, fullURL, resp, body, sentBody); vul {
+
+	vul, det := tc.Detector(method, fullURL, resp, body, sentBody)
+
+	if vul {
+		if method == "POST" && sentBody != "" {
+			if det != "" {
+				det += " "
+			}
+			det += "[body:" + sentBody + "]"
+		}
 		return formatVuln(tc.Name, method, fullURL, det)
-	} else if !onlyPOC {
-		return formatNotVuln(tc.Name, method, fullURL)
 	}
+
+	if !onlyPOC {
+		msg := formatNotVuln(tc.Name, method, fullURL)
+		if method == "POST" && sentBody != "" {
+			msg += " [body:" + sentBody + "]"
+		}
+		return msg
+	}
+
 	return ""
 }
 
-// -------------------- Leitura bruta de response head (CRLF) --------------------
+// -------------------- CRLF raw --------------------
 
-// fetchRawResponseHead abre conexão "na unha" (com proxy HTTP opcional) e retorna apenas os headers brutos até \r\n\r\n
 func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders, proxyURL string) (string, error) {
 	u, err := url.Parse(fullURL)
 	if err != nil {
@@ -555,7 +600,6 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 		b.WriteString("Host: " + u.Host + "\r\n")
 
 		for k, v := range final {
-			// não duplicar Host; e em POST não enviar Content-Type aqui
 			if strings.EqualFold(k, "Host") {
 				continue
 			}
@@ -571,6 +615,7 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 			}
 			b.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
 		}
+
 		b.WriteString("\r\n")
 		if method == "POST" && body != "" {
 			b.WriteString(body)
@@ -599,7 +644,6 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 		return strings.TrimSuffix(head.String(), "\r\n\r\n"), nil
 	}
 
-	// sem proxy
 	if proxyURL == "" {
 		conn, err = net.DialTimeout("tcp", host, dialTimeout)
 		if err != nil {
@@ -610,7 +654,6 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 		return readHead(conn, "", needTLS)
 	}
 
-	// via HTTP proxy (só suporta http proxy para leitura crua)
 	pURL, err := url.Parse(proxyURL)
 	if err != nil {
 		return "", err
@@ -628,12 +671,10 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 	}
 	defer conn.Close()
 
-	// se target é http, fazemos request direto para proxy com request-target absoluto
 	if u.Scheme == "http" {
 		return readHead(conn, u.String(), false)
 	}
 
-	// se target é https, usamos CONNECT e então TLS handshake
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host, u.Host)
 	conn.SetDeadline(time.Now().Add(8 * time.Second))
 	if _, err := conn.Write([]byte(connectReq)); err != nil {
@@ -676,7 +717,6 @@ func readBodyDecodedLimit(resp *http.Response, max int64) ([]byte, error) {
 	case "gzip":
 		gr, err := gzip.NewReader(io.LimitReader(resp.Body, max))
 		if err != nil {
-			// fallback cru
 			return io.ReadAll(r)
 		}
 		defer gr.Close()
@@ -692,7 +732,6 @@ func readBodyDecodedLimit(resp *http.Response, max int64) ([]byte, error) {
 
 func formatVuln(kind, method, urlStr, detail string) string {
 	if onlyPOC {
-		// formato somente PoC: "<url> | <Kind>"
 		return fmt.Sprintf("%s%s | %s%s", colorRed, urlStr, kind, colorReset)
 	}
 	msg := fmt.Sprintf("Vulnerable [%s] - %s %s", kind, method, urlStr)
@@ -715,17 +754,12 @@ func parseScanOptions(opt string) map[int]bool {
 		return nil
 	}
 	m := make(map[int]bool)
-	parts := strings.Split(opt, ",")
-	for _, p := range parts {
+	for _, p := range strings.Split(opt, ",") {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			continue
-		}
-		if n > 0 {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 {
 			m[n] = true
 		}
 	}
